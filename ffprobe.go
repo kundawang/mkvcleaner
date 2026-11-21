@@ -8,21 +8,25 @@ import (
 	"strings"
 )
 
+type FFProbeStream struct {
+	Index     int    `json:"index"`
+	CodecName string `json:"codec_name"`
+	CodecType string `json:"codec_type"`
+	Tags      struct {
+		Title    string `json:"title"`
+		Language string `json:"language"`
+	} `json:"tags"`
+	Disposition struct {
+		Default  int `json:"default"`
+		Dub      int `json:"dub"`
+		Original int `json:"original"`
+		Comment  int `json:"comment"`
+		Forced   int `json:"forced"`
+	} `json:"disposition"`
+}
+
 type FFProbe struct {
-	Streams []struct {
-		Index     int    `json:"index"`
-		CodecName string `json:"codec_name"`
-		CodecType string `json:"codec_type"`
-		Tags      struct {
-			Title    string `json:"title"`
-			Language string `json:"language"`
-		} `json:"tags"`
-		Disposition struct {
-			Default  int `json:"default"`
-			Dub      int `json:"dub"`
-			Original int `json:"original"`
-		} `json:"disposition"`
-	} `json:"streams"`
+	Streams []FFProbeStream `json:"streams"`
 }
 
 type FFProbeTrack struct {

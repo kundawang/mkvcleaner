@@ -13,14 +13,31 @@ import (
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+// options carries the runtime configuration down to processFiles.
+type options struct {
+	languages []string
+	// strategy, when non-nil, enables per-track-type filtering; when nil,
+	// the legacy single shared language list is used.
+	strategy  *TrackStrategy
+	automatic bool
+}
+
 func main() {
 	// Declare the flags
 	var wantedLanguages string
+	var wantedAudioLanguages string
+	var wantedSubtitleLanguages string
+	var keepForced bool
+	var keepCommentary bool
 	var automatic bool
 	var showVersion bool
 
 	// Define the flags
 	flag.StringVar(&wantedLanguages, "langs", "und,eng,swe,jap,jpn", "comma-separated list of languages")
+	flag.StringVar(&wantedAudioLanguages, "audio-langs", "", "comma-separated priority list of audio languages (defaults to --langs)")
+	flag.StringVar(&wantedSubtitleLanguages, "subtitle-langs", "", "comma-separated priority list of subtitle languages (defaults to --langs)")
+	flag.BoolVar(&keepForced, "keep-forced", false, "keep forced subtitle tracks regardless of language")
+	flag.BoolVar(&keepCommentary, "keep-commentary", false, "keep commentary audio tracks regardless of language")
 	flag.BoolVar(&automatic, "automatic", false, "make the program non-interactive")
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 
@@ -34,6 +51,31 @@ func main() {
 
 	// Convert the comma-separated string of languages into a slice
 	languages := strings.Split(wantedLanguages, ",")
+
+	opts := options{
+		languages: languages,
+		automatic: automatic,
+	}
+
+	// Any of the per-track-type flags switches to strategy mode; unset
+	// language lists fall back to the --langs list.
+	if wantedAudioLanguages != "" || wantedSubtitleLanguages != "" || keepForced || keepCommentary {
+		strategy := &TrackStrategy{
+			AudioLanguages:    languages,
+			SubtitleLanguages: languages,
+			KeepForced:        keepForced,
+			KeepCommentary:    keepCommentary,
+		}
+
+		if wantedAudioLanguages != "" {
+			strategy.AudioLanguages = splitLanguages(wantedAudioLanguages)
+		}
+		if wantedSubtitleLanguages != "" {
+			strategy.SubtitleLanguages = splitLanguages(wantedSubtitleLanguages)
+		}
+
+		opts.strategy = strategy
+	}
 
 	var fileNames []string
 
@@ -54,10 +96,10 @@ func main() {
 		}
 	}
 
-	processFiles(fileNames, languages, automatic)
+	processFiles(fileNames, opts)
 }
 
-func processFiles(fileNames []string, wantedLanguages []string, automatic bool) {
+func processFiles(fileNames []string, opts options) {
 	// Count all the files
 	fileCount := len(fileNames)
 	fileNo := 0
@@ -68,22 +110,35 @@ func processFiles(fileNames []string, wantedLanguages []string, automatic bool) 
 		var ffprobe FFProbe
 
 		// Identify the input file to index all the tracks using ffprobe.
-		ffprobe.Identify(fileName)
+		if err := ffprobe.Identify(fileName); err != nil {
+			fmt.Printf("[%d/%d] Failed to identify %s\n", fileNo, fileCount, fileName)
+			fmt.Printf("[%d/%d] Error: %s\n", fileNo, fileCount, err)
+			continue
+		}
 
 		// Put the filtered data into ffmpeg to build and run an
 		// ffmpeg command to copy the wanted tracks to a new file.
-		ffmpeg := FFMpeg{
-			inputFilePath:  fileName,
-			audioTracks:    ffprobe.GetAudioTracks(wantedLanguages),
-			subtitleTracks: ffprobe.GetSubtitleTracks(wantedLanguages),
-			videoTracks:    ffprobe.GetVideoTracks(),
+		ffmpeg := FFMpeg{inputFilePath: fileName}
+
+		var allTracks []int
+
+		if opts.strategy != nil {
+			// Per-track-type strategy: keep tracks in original stream
+			// order and adjust default-track dispositions to match the
+			// language priorities.
+			allTracks, ffmpeg.dispositions = ffprobe.PlanTracks(*opts.strategy)
+			ffmpeg.mapOrder = allTracks
+		} else {
+			ffmpeg.audioTracks = ffprobe.GetAudioTracks(opts.languages)
+			ffmpeg.subtitleTracks = ffprobe.GetSubtitleTracks(opts.languages)
+			ffmpeg.videoTracks = ffprobe.GetVideoTracks()
+
+			// Merge all the tracks we want to keep to a single slice.
+			allTracks = append(ffmpeg.videoTracks, append(ffmpeg.audioTracks, ffmpeg.subtitleTracks...)...)
 		}
 
 		// Some nice output.
 		fmt.Printf("[%d/%d] Preparing to process %s\n", fileNo, fileCount, fileName)
-
-		// Merge all the tracks we want to keep to a single slice.
-		allTracks := append(ffmpeg.videoTracks, append(ffmpeg.audioTracks, ffmpeg.subtitleTracks...)...)
 
 		// Print a table for the overview of the changes
 		table := tablewriter.NewWriter(os.Stdout)
@@ -104,9 +159,16 @@ func processFiles(fileNames []string, wantedLanguages []string, automatic bool) 
 
 		fmt.Printf("[%d/%d] Command to execute: %s\n", fileNo, fileCount, ffmpeg.FormatCommandParts())
 
+		// A leftover temporary output file means a previous run was
+		// interrupted; refuse to clobber it.
+		if _, err := os.Stat(ffmpeg.outputFilePath); err == nil {
+			fmt.Printf("[%d/%d] Temporary output file %s already exists, remove it and run again; skipping %s\n", fileNo, fileCount, ffmpeg.outputFilePath, fileName)
+			continue
+		}
+
 		// If the doesn't run in automatic mode, we prompt the user
 		// for a confirmation to apply changes.
-		if !automatic {
+		if !opts.automatic {
 			fmt.Printf("[%d/%d] Run ffmpeg command on %s? [Y/n] ", fileNo, fileCount, fileName)
 
 			// Prompt user for a confirmation of the actions that will be
@@ -129,6 +191,10 @@ func processFiles(fileNames []string, wantedLanguages []string, automatic bool) 
 		if err != nil {
 			fmt.Printf("[%d/%d] Failed at running ffmpeg command\n", fileNo, fileCount)
 			fmt.Printf("[%d/%d] Error: %s\n", fileNo, fileCount, err)
+
+			// Remove any partial output; the original file is left
+			// untouched.
+			os.Remove(ffmpeg.outputFilePath)
 			continue
 		}
 
